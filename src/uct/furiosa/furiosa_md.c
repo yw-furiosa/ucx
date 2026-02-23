@@ -31,6 +31,8 @@ static ucs_config_field_t uct_furiosa_md_config_table[] = {
 static ucs_status_t uct_furiosa_md_query(uct_md_h md, uct_md_attr_v2_t *attr)
 {
     uct_md_base_md_query(attr);
+    attr->flags            = UCT_MD_FLAG_REG;
+    attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
     attr->detect_mem_types = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
     attr->dmabuf_mem_types = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
     return UCS_OK;
@@ -151,14 +153,101 @@ uct_furiosa_md_detect_memory_type(uct_md_h md, const void *addr, size_t length,
     return UCS_OK;
 }
 
+
+static ucs_status_t
+uct_furiosa_md_mem_reg(uct_md_h uct_md, void *address, size_t length,
+                       const uct_md_mem_reg_params_t *params,
+                       uct_mem_h *memh_p)
+{
+    uct_furiosa_md_t *md = ucs_derived_of(uct_md, uct_furiosa_md_t);
+    uct_furiosa_mem_t *memh;
+    void *begin;
+    void *end;
+    uint64_t offset;
+
+    if (md->dmabuf_addr == NULL) {
+        ucs_error("furiosa: cannot register memory, BAR4 not mapped");
+        return UCS_ERR_UNSUPPORTED;
+    }
+
+    begin = md->dmabuf_addr;
+    end   = (uint8_t *)begin + md->dmabuf_size;
+
+    if ((address >= begin) && ((uint8_t *)address + length <= (uint8_t *)end)) {
+        /* Fully inside BAR4: fall through to NPU registration below */
+    } else if ((uint8_t *)address + length <= (uint8_t *)begin ||
+               address >= end) {
+        /* Fully outside BAR4: host memory passthrough registration.
+         * Our put/get operations use remote_addr directly (not rkey),
+         * so the bar_offset is irrelevant for host-to-host copies. */
+        memh = ucs_malloc(sizeof(*memh), "uct_furiosa_mem_t");
+        if (memh == NULL) {
+            return UCS_ERR_NO_MEMORY;
+        }
+
+        memh->bar_offset = 0;
+        memh->address    = address;
+        memh->length     = length;
+        memh->device_id  = md->device_id;
+
+        ucs_debug("furiosa: host mem_reg addr=%p len=%zu (passthrough)",
+                  address, length);
+
+        *memh_p = memh;
+        return UCS_OK;
+    } else {
+        /* Partially overlapping BAR4 region: reject */
+        ucs_error("furiosa: address %p length %zu partially overlaps "
+                  "BAR4 range [%p, %p)",
+                  address, length, begin, end);
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    memh = ucs_malloc(sizeof(*memh), "uct_furiosa_mem_t");
+    if (memh == NULL) {
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    /* Compute offset relative to BAR4 physical base (including reserved) */
+    offset = (uint64_t)UCS_PTR_BYTE_DIFF(begin, address) +
+             NPU_BAR4_RESERVED_SIZE;
+
+    memh->bar_offset = offset;
+    memh->address    = address;
+    memh->length     = length;
+    memh->device_id  = md->device_id;
+
+    ucs_debug("furiosa: mem_reg addr=%p len=%zu bar_offset=0x%" PRIx64
+              " dev=%u",
+              address, length, memh->bar_offset, memh->device_id);
+
+    *memh_p = memh;
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_md_mem_dereg(uct_md_h uct_md,
+                         const uct_md_mem_dereg_params_t *params)
+{
+    uct_furiosa_mem_t *memh;
+
+    UCT_MD_MEM_DEREG_CHECK_PARAMS(params, 0);
+
+    memh = params->memh;
+    ucs_debug("furiosa: mem_dereg addr=%p len=%zu", memh->address,
+              memh->length);
+    ucs_free(memh);
+    return UCS_OK;
+}
+
 static uct_md_ops_t uct_furiosa_md_ops = {
     .close              = uct_furiosa_md_close,
     .query              = uct_furiosa_md_query,
     .mem_alloc          = (uct_md_mem_alloc_func_t)ucs_empty_function_return_unsupported,
     .mem_free           = (uct_md_mem_free_func_t)ucs_empty_function_return_unsupported,
     .mem_advise         = (uct_md_mem_advise_func_t)ucs_empty_function_return_unsupported,
-    .mem_reg            = (uct_md_mem_reg_func_t)ucs_empty_function_return_unsupported,
-    .mem_dereg          = (uct_md_mem_dereg_func_t)ucs_empty_function_return_unsupported,
+    .mem_reg            = uct_furiosa_md_mem_reg,
+    .mem_dereg          = uct_furiosa_md_mem_dereg,
     .mem_query          = uct_furiosa_md_mem_query,
     .mkey_pack          = (uct_md_mkey_pack_func_t)ucs_empty_function_return_unsupported,
     .mem_attach         = (uct_md_mem_attach_func_t)ucs_empty_function_return_unsupported,
