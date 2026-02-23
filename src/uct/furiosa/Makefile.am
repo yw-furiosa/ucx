@@ -16,10 +16,12 @@ libuct_furiosa_la_LDFLAGS  = $(FURIOSA_LDFLAGS) $(FURIOSA_LIBS) -version-info $(
 
 noinst_HEADERS = \
     base/furiosa_base.h \
+    furiosa_iface.h \
     furiosa_md.h
 
 libuct_furiosa_la_SOURCES = \
     base/furiosa_base.c \
+    furiosa_iface.c \
     furiosa_md.c
 
 PKG_CONFIG_NAME=furiosa
