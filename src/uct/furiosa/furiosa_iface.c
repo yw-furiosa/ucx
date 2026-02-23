@@ -12,6 +12,35 @@
 
 #include <uct/furiosa/base/furiosa_base.h>
 
+#include <string.h>
+#include <limits.h>
+
+static ucs_status_t
+uct_furiosa_ep_put_short(uct_ep_h tl_ep, const void *buffer,
+                         unsigned length, uint64_t remote_addr,
+                         uct_rkey_t rkey)
+{
+    if (ucs_likely(length != 0)) {
+        memcpy((void *)(uintptr_t)remote_addr, buffer, length);
+    }
+
+    UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t), PUT, SHORT,
+                      length);
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_ep_get_short(uct_ep_h tl_ep, void *buffer, unsigned length,
+                         uint64_t remote_addr, uct_rkey_t rkey)
+{
+    if (ucs_likely(length != 0)) {
+        memcpy(buffer, (void *)(uintptr_t)remote_addr, length);
+    }
+
+    UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t), GET, SHORT,
+                      length);
+    return UCS_OK;
+}
 
 static ucs_status_t
 uct_furiosa_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
@@ -20,13 +49,35 @@ uct_furiosa_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
                                                  uct_furiosa_iface_t);
 
     uct_base_iface_query(&iface->super, iface_attr);
-    iface_attr->cap.flags          = UCT_IFACE_FLAG_CONNECT_TO_IFACE;
+    iface_attr->cap.flags          = UCT_IFACE_FLAG_PUT_SHORT |
+                                     UCT_IFACE_FLAG_GET_SHORT |
+                                     UCT_IFACE_FLAG_CONNECT_TO_IFACE;
+    iface_attr->cap.put.max_short   = UINT_MAX;
+    iface_attr->cap.get.max_short   = UINT_MAX;
     iface_attr->bandwidth.dedicated = 0.0001;
     iface_attr->bandwidth.shared    = 0;
-    iface_attr->max_num_eps         = 0;
+    iface_attr->max_num_eps         = SIZE_MAX;
 
     return UCS_OK;
 }
+
+static UCS_CLASS_INIT_FUNC(uct_furiosa_ep_t, const uct_ep_params_t *params)
+{
+    uct_furiosa_iface_t *iface = ucs_derived_of(params->iface,
+                                                 uct_furiosa_iface_t);
+
+    UCS_CLASS_CALL_SUPER_INIT(uct_base_ep_t, &iface->super);
+    return UCS_OK;
+}
+
+static UCS_CLASS_CLEANUP_FUNC(uct_furiosa_ep_t)
+{
+}
+
+UCS_CLASS_DEFINE(uct_furiosa_ep_t, uct_base_ep_t);
+UCS_CLASS_DEFINE_NEW_FUNC(uct_furiosa_ep_t, uct_ep_t,
+                          const uct_ep_params_t *);
+UCS_CLASS_DEFINE_DELETE_FUNC(uct_furiosa_ep_t, uct_ep_t);
 
 static uct_iface_ops_t uct_furiosa_iface_ops = {
     .ep_pending_purge = (uct_ep_pending_purge_func_t)ucs_empty_function,
@@ -34,9 +85,9 @@ static uct_iface_ops_t uct_furiosa_iface_ops = {
     .ep_disconnect = (uct_ep_disconnect_func_t)ucs_empty_function_return_success,
     .cm_ep_conn_notify = (uct_cm_ep_conn_notify_func_t)
             ucs_empty_function_return_unsupported,
-    .ep_destroy = (uct_ep_destroy_func_t)ucs_empty_function_return_unsupported,
-    .ep_put_short = (uct_ep_put_short_func_t)
-            ucs_empty_function_return_unsupported,
+    .ep_destroy = UCS_CLASS_DELETE_FUNC_NAME(uct_furiosa_ep_t),
+    .ep_put_short = uct_furiosa_ep_put_short,
+    .ep_get_short = uct_furiosa_ep_get_short,
     .ep_put_bcopy = (uct_ep_put_bcopy_func_t)
             ucs_empty_function_return_unsupported,
     .ep_get_bcopy = (uct_ep_get_bcopy_func_t)
@@ -62,7 +113,7 @@ static uct_iface_ops_t uct_furiosa_iface_ops = {
     .ep_flush    = (uct_ep_flush_func_t)ucs_empty_function_return_success,
     .ep_fence    = (uct_ep_fence_func_t)ucs_empty_function_return_unsupported,
     .ep_check    = (uct_ep_check_func_t)ucs_empty_function_return_unsupported,
-    .ep_create   = (uct_ep_create_func_t)ucs_empty_function_return_unsupported,
+    .ep_create   = UCS_CLASS_NEW_FUNC_NAME(uct_furiosa_ep_t),
     .iface_flush = (uct_iface_flush_func_t)ucs_empty_function_return_unsupported,
     .iface_fence = (uct_iface_fence_func_t)ucs_empty_function_return_unsupported,
     .iface_progress_enable  = (uct_iface_progress_enable_func_t)
@@ -121,6 +172,7 @@ UCS_CLASS_DEFINE(uct_furiosa_iface_t, uct_base_iface_t);
 UCS_CLASS_DEFINE_NEW_FUNC(uct_furiosa_iface_t, uct_iface_t, uct_md_h,
                           uct_worker_h, const uct_iface_params_t*,
                           const uct_iface_config_t*);
+
 
 UCT_TL_DEFINE(&uct_furiosa_component, furiosa, uct_furiosa_base_query_devices,
               uct_furiosa_iface_t, "FURIOSA_", uct_iface_config_table,

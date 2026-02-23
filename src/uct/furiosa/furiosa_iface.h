@@ -14,4 +14,9 @@ typedef struct uct_furiosa_iface {
     uct_base_iface_t super;
 } uct_furiosa_iface_t;
 
+
+typedef struct uct_furiosa_ep {
+    uct_base_ep_t super;
+} uct_furiosa_ep_t;
+
 #endif
