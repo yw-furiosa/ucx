@@ -1,0 +1,10 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: ucx-furiosa
+Description: UCX Furiosa NPU transport
+Version: @VERSION@
+Libs: -L${libdir} -luct_furiosa
+Cflags: -I${includedir}
