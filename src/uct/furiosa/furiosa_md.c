@@ -31,10 +31,11 @@ static ucs_config_field_t uct_furiosa_md_config_table[] = {
 static ucs_status_t uct_furiosa_md_query(uct_md_h md, uct_md_attr_v2_t *attr)
 {
     uct_md_base_md_query(attr);
-    attr->flags            = UCT_MD_FLAG_REG;
+    attr->flags            = UCT_MD_FLAG_REG | UCT_MD_FLAG_NEED_RKEY;
     attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
     attr->detect_mem_types = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
     attr->dmabuf_mem_types = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
+    attr->rkey_packed_size = sizeof(uct_furiosa_rkey_t);
     return UCS_OK;
 }
 
@@ -240,6 +241,69 @@ uct_furiosa_md_mem_dereg(uct_md_h uct_md,
     return UCS_OK;
 }
 
+
+static ucs_status_t
+uct_furiosa_md_mkey_pack(uct_md_h uct_md, uct_mem_h memh, void *address,
+                         size_t length,
+                         const uct_md_mkey_pack_params_t *params,
+                         void *mkey_buffer)
+{
+    uct_furiosa_md_t *md        = ucs_derived_of(uct_md, uct_furiosa_md_t);
+    uct_furiosa_mem_t *mem_hndl = memh;
+    uct_furiosa_rkey_t *packed  = mkey_buffer;
+
+    packed->bar_phys_addr = md->bar_phys_addr;
+    packed->bar_offset    = mem_hndl->bar_offset;
+    packed->length        = mem_hndl->length;
+    packed->device_id     = mem_hndl->device_id;
+
+    ucs_debug("furiosa: mkey_pack bar_phys=0x%" PRIx64
+              " offset=0x%" PRIx64 " len=%zu dev=%u",
+              packed->bar_phys_addr, packed->bar_offset,
+              packed->length, packed->device_id);
+
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_rkey_unpack(uct_component_t *component, const void *rkey_buffer,
+                        const uct_rkey_unpack_params_t *params,
+                        uct_rkey_t *rkey_p, void **handle_p)
+{
+    const uct_furiosa_rkey_t *packed = rkey_buffer;
+    uct_furiosa_rkey_t *key;
+
+    key = ucs_malloc(sizeof(*key), "uct_furiosa_rkey_t");
+    if (key == NULL) {
+        ucs_error("failed to allocate memory for uct_furiosa_rkey_t");
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    key->bar_phys_addr = packed->bar_phys_addr;
+    key->bar_offset    = packed->bar_offset;
+    key->length        = packed->length;
+    key->device_id     = packed->device_id;
+
+    *handle_p = NULL;
+    *rkey_p   = (uintptr_t)key;
+
+    ucs_debug("furiosa: rkey_unpack bar_phys=0x%" PRIx64
+              " offset=0x%" PRIx64 " len=%zu dev=%u",
+              key->bar_phys_addr, key->bar_offset,
+              key->length, key->device_id);
+
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_rkey_release(uct_component_t *component, uct_rkey_t rkey,
+                         void *handle)
+{
+    ucs_assert(handle == NULL);
+    ucs_free((void *)rkey);
+    return UCS_OK;
+}
+
 static uct_md_ops_t uct_furiosa_md_ops = {
     .close              = uct_furiosa_md_close,
     .query              = uct_furiosa_md_query,
@@ -249,7 +313,7 @@ static uct_md_ops_t uct_furiosa_md_ops = {
     .mem_reg            = uct_furiosa_md_mem_reg,
     .mem_dereg          = uct_furiosa_md_mem_dereg,
     .mem_query          = uct_furiosa_md_mem_query,
-    .mkey_pack          = (uct_md_mkey_pack_func_t)ucs_empty_function_return_unsupported,
+    .mkey_pack          = uct_furiosa_md_mkey_pack,
     .mem_attach         = (uct_md_mem_attach_func_t)ucs_empty_function_return_unsupported,
     .detect_memory_type = uct_furiosa_md_detect_memory_type,
 };
@@ -354,11 +418,10 @@ uct_component_t uct_furiosa_component = {
     .md_open            = uct_furiosa_md_open,
     .cm_open            = (uct_component_cm_open_func_t)
                           ucs_empty_function_return_unsupported,
-    .rkey_unpack        = uct_md_stub_rkey_unpack,
+    .rkey_unpack        = uct_furiosa_rkey_unpack,
     .rkey_ptr           = (uct_component_rkey_ptr_func_t)
                           ucs_empty_function_return_unsupported,
-    .rkey_release       = (uct_component_rkey_release_func_t)
-                          ucs_empty_function_return_success,
+    .rkey_release       = uct_furiosa_rkey_release,
     .rkey_compare       = uct_base_rkey_compare,
     .name               = "furiosa",
     .md_config          = {

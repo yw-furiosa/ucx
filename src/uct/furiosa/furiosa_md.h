@@ -38,6 +38,20 @@ typedef struct uct_furiosa_mem {
     unsigned         device_id;     /**< NPU device index */
 } uct_furiosa_mem_t;
 
+
+/**
+ * Packed remote key for Furiosa NPU memory.
+ * Serialized by mkey_pack on the local side and deserialized by
+ * rkey_unpack on the remote side.  Contains everything the remote
+ * endpoint needs to identify the BAR4 region for RDMA.
+ */
+typedef struct uct_furiosa_rkey {
+    uint64_t         bar_phys_addr;  /**< BAR4 physical base address */
+    uint64_t         bar_offset;     /**< offset within BAR4 */
+    size_t           length;         /**< registered length */
+    unsigned         device_id;      /**< NPU device index */
+} uct_furiosa_rkey_t;
+
 typedef struct uct_furiosa_md_config {
     uct_md_config_t  super;
     int              device_id;
