@@ -14,6 +14,7 @@
 
 #include <string.h>
 #include <limits.h>
+#include <uct/base/uct_iov.inl>
 
 static ucs_status_t
 uct_furiosa_ep_put_short(uct_ep_h tl_ep, const void *buffer,
@@ -43,20 +44,64 @@ uct_furiosa_ep_get_short(uct_ep_h tl_ep, void *buffer, unsigned length,
 }
 
 static ucs_status_t
+uct_furiosa_ep_put_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
+                         size_t iovcnt, uint64_t remote_addr,
+                         uct_rkey_t rkey, uct_completion_t *comp)
+{
+    size_t size = uct_iov_get_length(iov);
+
+    if (ucs_likely(size != 0)) {
+        memcpy((void *)(uintptr_t)remote_addr, iov->buffer, size);
+    }
+
+    UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t), PUT, ZCOPY,
+                      uct_iov_total_length(iov, iovcnt));
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_ep_get_zcopy(uct_ep_h tl_ep, const uct_iov_t *iov,
+                         size_t iovcnt, uint64_t remote_addr,
+                         uct_rkey_t rkey, uct_completion_t *comp)
+{
+    size_t size = uct_iov_get_length(iov);
+
+    if (ucs_likely(size != 0)) {
+        memcpy(iov->buffer, (void *)(uintptr_t)remote_addr, size);
+    }
+
+    UCT_TL_EP_STAT_OP(ucs_derived_of(tl_ep, uct_base_ep_t), GET, ZCOPY,
+                      uct_iov_total_length(iov, iovcnt));
+    return UCS_OK;
+}
+
+static ucs_status_t
 uct_furiosa_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
 {
     uct_furiosa_iface_t *iface = ucs_derived_of(tl_iface,
                                                  uct_furiosa_iface_t);
 
     uct_base_iface_query(&iface->super, iface_attr);
-    iface_attr->cap.flags          = UCT_IFACE_FLAG_PUT_SHORT |
-                                     UCT_IFACE_FLAG_GET_SHORT |
-                                     UCT_IFACE_FLAG_CONNECT_TO_IFACE;
-    iface_attr->cap.put.max_short   = UINT_MAX;
-    iface_attr->cap.get.max_short   = UINT_MAX;
-    iface_attr->bandwidth.dedicated = 0.0001;
-    iface_attr->bandwidth.shared    = 0;
-    iface_attr->max_num_eps         = SIZE_MAX;
+    iface_attr->cap.flags              = UCT_IFACE_FLAG_PUT_SHORT |
+                                         UCT_IFACE_FLAG_GET_SHORT |
+                                         UCT_IFACE_FLAG_PUT_ZCOPY |
+                                         UCT_IFACE_FLAG_GET_ZCOPY |
+                                         UCT_IFACE_FLAG_CONNECT_TO_IFACE;
+    iface_attr->cap.put.max_short       = UINT_MAX;
+    iface_attr->cap.put.min_zcopy       = 0;
+    iface_attr->cap.put.max_zcopy       = SIZE_MAX;
+    iface_attr->cap.put.opt_zcopy_align = 1;
+    iface_attr->cap.put.align_mtu       = iface_attr->cap.put.opt_zcopy_align;
+    iface_attr->cap.put.max_iov         = 1;
+    iface_attr->cap.get.max_short       = UINT_MAX;
+    iface_attr->cap.get.min_zcopy       = 0;
+    iface_attr->cap.get.max_zcopy       = SIZE_MAX;
+    iface_attr->cap.get.opt_zcopy_align = 1;
+    iface_attr->cap.get.align_mtu       = iface_attr->cap.get.opt_zcopy_align;
+    iface_attr->cap.get.max_iov         = 1;
+    iface_attr->bandwidth.dedicated     = 0.0001;
+    iface_attr->bandwidth.shared        = 0;
+    iface_attr->max_num_eps             = SIZE_MAX;
 
     return UCS_OK;
 }
@@ -88,6 +133,8 @@ static uct_iface_ops_t uct_furiosa_iface_ops = {
     .ep_destroy = UCS_CLASS_DELETE_FUNC_NAME(uct_furiosa_ep_t),
     .ep_put_short = uct_furiosa_ep_put_short,
     .ep_get_short = uct_furiosa_ep_get_short,
+    .ep_put_zcopy = uct_furiosa_ep_put_zcopy,
+    .ep_get_zcopy = uct_furiosa_ep_get_zcopy,
     .ep_put_bcopy = (uct_ep_put_bcopy_func_t)
             ucs_empty_function_return_unsupported,
     .ep_get_bcopy = (uct_ep_get_bcopy_func_t)
