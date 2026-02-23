@@ -32,7 +32,8 @@ static ucs_status_t uct_furiosa_md_query(uct_md_h md, uct_md_attr_v2_t *attr)
 {
     uct_md_base_md_query(attr);
     attr->flags            = UCT_MD_FLAG_REG | UCT_MD_FLAG_NEED_RKEY;
-    attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
+    attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_RDMA) |
+                             UCS_BIT(UCS_MEMORY_TYPE_HOST);
     attr->detect_mem_types = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
     attr->dmabuf_mem_types = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
     attr->rkey_packed_size = sizeof(uct_furiosa_rkey_t);

@@ -124,6 +124,16 @@ UCS_CLASS_DEFINE_NEW_FUNC(uct_furiosa_ep_t, uct_ep_t,
                           const uct_ep_params_t *);
 UCS_CLASS_DEFINE_DELETE_FUNC(uct_furiosa_ep_t, uct_ep_t);
 
+static int
+uct_furiosa_iface_is_reachable(const uct_iface_h tl_iface,
+                               const uct_device_addr_t *dev_addr,
+                               const uct_iface_addr_t *iface_addr)
+{
+    /* PoC: same-host / loopback always reachable */
+    return 1;
+}
+
+
 static uct_iface_ops_t uct_furiosa_iface_ops = {
     .ep_pending_purge = (uct_ep_pending_purge_func_t)ucs_empty_function,
     .ep_connect    = (uct_ep_connect_func_t)ucs_empty_function_return_success,
@@ -158,11 +168,11 @@ static uct_iface_ops_t uct_furiosa_iface_ops = {
     .ep_pending_add    = (uct_ep_pending_add_func_t)
             ucs_empty_function_return_unsupported,
     .ep_flush    = (uct_ep_flush_func_t)ucs_empty_function_return_success,
-    .ep_fence    = (uct_ep_fence_func_t)ucs_empty_function_return_unsupported,
+    .ep_fence    = (uct_ep_fence_func_t)ucs_empty_function_return_success,
     .ep_check    = (uct_ep_check_func_t)ucs_empty_function_return_unsupported,
     .ep_create   = UCS_CLASS_NEW_FUNC_NAME(uct_furiosa_ep_t),
-    .iface_flush = (uct_iface_flush_func_t)ucs_empty_function_return_unsupported,
-    .iface_fence = (uct_iface_fence_func_t)ucs_empty_function_return_unsupported,
+    .iface_flush = (uct_iface_flush_func_t)ucs_empty_function_return_success,
+    .iface_fence = (uct_iface_fence_func_t)ucs_empty_function_return_success,
     .iface_progress_enable  = (uct_iface_progress_enable_func_t)
             ucs_empty_function,
     .iface_progress_disable = (uct_iface_progress_disable_func_t)
@@ -178,7 +188,7 @@ static uct_iface_ops_t uct_furiosa_iface_ops = {
             ucs_empty_function_return_success,
     .iface_get_address        = (uct_iface_get_address_func_t)
             ucs_empty_function_return_success,
-    .iface_is_reachable       = uct_base_iface_is_reachable
+    .iface_is_reachable       = uct_furiosa_iface_is_reachable
 };
 
 static uct_iface_internal_ops_t uct_furiosa_iface_internal_ops = {

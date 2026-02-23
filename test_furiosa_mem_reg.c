@@ -215,41 +215,48 @@ int main(int argc, char **argv)
         TEST_FAIL("mem_reg at 1MB offset failed");
     }
 
-    /* --- Test 4: Reject host memory --- */
-    printf("\n--- Test 4: Host memory registration should fail ---\n");
+    /* --- Test 4: Host memory passthrough registration --- */
+    printf("\n--- Test 4: Host memory registration (passthrough) ---\n");
     host_ptr = malloc(4096);
     assert(host_ptr != NULL);
     memset(&reg_params, 0, sizeof(reg_params));
     reg_params.field_mask = 0;
-
     status = uct_md_mem_reg_v2(md, host_ptr, 4096, &reg_params, &memh);
-    if (status != UCS_OK) {
-        TEST_PASS("host memory correctly rejected");
-    } else {
-        TEST_FAIL("host memory incorrectly accepted!");
-        /* cleanup */
+    if (status == UCS_OK) {
+        uct_furiosa_mem_t *hmem = (uct_furiosa_mem_t *)memh;
+        if (hmem->bar_offset == 0) {
+            TEST_PASS("host memory registered with bar_offset=0 (passthrough)");
+        } else {
+            TEST_FAIL("host memory bar_offset != 0");
+        }
         memset(&dereg_params, 0, sizeof(dereg_params));
         dereg_params.field_mask = UCT_MD_MEM_DEREG_FIELD_MEMH;
         dereg_params.memh       = memh;
         uct_md_mem_dereg_v2(md, &dereg_params);
+    } else {
+        TEST_FAIL("host memory registration failed (expected passthrough)");
     }
     free(host_ptr);
-
-    /* --- Test 5: Reject address past BAR4 end --- */
-    printf("\n--- Test 5: Address past BAR4 end should fail ---\n");
+    /* --- Test 5: Address past BAR4 end (passthrough) --- */
+    printf("\n--- Test 5: Address past BAR4 end (passthrough) ---\n");
     npu_ptr = (uint8_t *)fmd->dmabuf_addr + fmd->dmabuf_size;
     memset(&reg_params, 0, sizeof(reg_params));
     reg_params.field_mask = 0;
 
     status = uct_md_mem_reg_v2(md, npu_ptr, 4096, &reg_params, &memh);
-    if (status != UCS_OK) {
-        TEST_PASS("address past BAR4 end correctly rejected");
-    } else {
-        TEST_FAIL("address past BAR4 end incorrectly accepted!");
+    if (status == UCS_OK) {
+        uct_furiosa_mem_t *hmem = (uct_furiosa_mem_t *)memh;
+        if (hmem->bar_offset == 0) {
+            TEST_PASS("address past BAR4 registered as passthrough");
+        } else {
+            TEST_FAIL("address past BAR4 bar_offset != 0");
+        }
         memset(&dereg_params, 0, sizeof(dereg_params));
         dereg_params.field_mask = UCT_MD_MEM_DEREG_FIELD_MEMH;
         dereg_params.memh       = memh;
         uct_md_mem_dereg_v2(md, &dereg_params);
+    } else {
+        TEST_FAIL("address past BAR4 registration failed (expected passthrough)");
     }
 
     /* --- Test 6: Region spanning past BAR4 end (partial overlap → error) --- */

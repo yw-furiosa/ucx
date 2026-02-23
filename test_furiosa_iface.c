@@ -194,8 +194,8 @@ static void test_iface_query(uct_md_h md)
           "bandwidth.dedicated=%g (expected > 0)", attr.bandwidth.dedicated);
     CHECK(attr.bandwidth.shared == 0,
           "bandwidth.shared=%g (expected 0)", attr.bandwidth.shared);
-    CHECK(attr.max_num_eps == 0,
-          "max_num_eps=%zu (expected 0 for skeleton)", attr.max_num_eps);
+    CHECK(attr.max_num_eps > 0,
+          "max_num_eps=%zu (expected > 0)", attr.max_num_eps);
     CHECK(attr.device_addr_len == 0,
           "device_addr_len=%zu (expected 0)", attr.device_addr_len);
     CHECK(attr.iface_addr_len == 0,
@@ -207,7 +207,7 @@ static void test_iface_query(uct_md_h md)
     ucs_async_context_destroy(async);
 }
 
-static void test_ep_create_unsupported(uct_md_h md)
+static void test_ep_create(uct_md_h md)
 {
     ucs_async_context_t *async = NULL;
     uct_worker_h worker = NULL;
@@ -217,35 +217,33 @@ static void test_ep_create_unsupported(uct_md_h md)
     uct_iface_params_t iface_params;
     uct_ep_params_t ep_params;
     ucs_status_t status;
-
-    printf("\n[test_ep_create_unsupported]\n");
-
+    printf("\n[test_ep_create]\n");
     status = ucs_async_context_create(UCS_ASYNC_MODE_THREAD_SPINLOCK, &async);
     assert(status == UCS_OK);
     status = uct_worker_create(async, UCS_THREAD_MODE_SINGLE, &worker);
     assert(status == UCS_OK);
     status = uct_md_iface_config_read(md, "furiosa", NULL, NULL, &iface_config);
     assert(status == UCS_OK);
-
     memset(&iface_params, 0, sizeof(iface_params));
     iface_params.field_mask = UCT_IFACE_PARAM_FIELD_OPEN_MODE |
                               UCT_IFACE_PARAM_FIELD_DEVICE;
     iface_params.open_mode = UCT_IFACE_OPEN_MODE_DEVICE;
     iface_params.mode.device.tl_name  = "furiosa";
     iface_params.mode.device.dev_name = "furiosa";
-
     status = uct_iface_open(md, worker, &iface_params, iface_config, &iface);
     assert(status == UCS_OK);
-
     memset(&ep_params, 0, sizeof(ep_params));
     ep_params.field_mask = UCT_EP_PARAM_FIELD_IFACE;
     ep_params.iface      = iface;
-
     status = uct_ep_create(&ep_params, &ep);
-    CHECK(status == UCS_ERR_UNSUPPORTED,
-          "ep_create returned %d (expected UCS_ERR_UNSUPPORTED=%d)",
-          status, UCS_ERR_UNSUPPORTED);
+    CHECK(status == UCS_OK,
+          "ep_create returned %d (expected UCS_OK=%d)",
+          status, UCS_OK);
+    CHECK(ep != NULL, "ep handle is non-NULL");
 
+    if (ep != NULL) {
+        uct_ep_destroy(ep);
+    }
     uct_iface_close(iface);
     uct_config_release(iface_config);
     uct_worker_destroy(worker);
@@ -277,7 +275,7 @@ int main(void)
     test_tl_resource_query(md);
     test_iface_open_close(md);
     test_iface_query(md);
-    test_ep_create_unsupported(md);
+    test_ep_create(md);
 
     uct_md_close(md);
     uct_config_release(md_config);
