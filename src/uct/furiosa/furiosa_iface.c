@@ -14,6 +14,7 @@
 
 #include <string.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <uct/base/uct_iov.inl>
 
 static ucs_status_t
@@ -82,6 +83,9 @@ uct_furiosa_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
                                                  uct_furiosa_iface_t);
 
     uct_base_iface_query(&iface->super, iface_attr);
+    iface_attr->iface_addr_len          = sizeof(uct_furiosa_iface_addr_t);
+    iface_attr->device_addr_len         = 0;
+    iface_attr->ep_addr_len             = 0;
     iface_attr->cap.flags              = UCT_IFACE_FLAG_PUT_SHORT |
                                          UCT_IFACE_FLAG_GET_SHORT |
                                          UCT_IFACE_FLAG_PUT_ZCOPY |
@@ -99,8 +103,11 @@ uct_furiosa_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     iface_attr->cap.get.opt_zcopy_align = 1;
     iface_attr->cap.get.align_mtu       = iface_attr->cap.get.opt_zcopy_align;
     iface_attr->cap.get.max_iov         = 1;
+    iface_attr->latency                 = ucs_linear_func_make(1e-9, 0);
     iface_attr->bandwidth.dedicated     = 0.0001;
     iface_attr->bandwidth.shared        = 0;
+    iface_attr->overhead                = 0;
+    iface_attr->priority                = 0;
     iface_attr->max_num_eps             = SIZE_MAX;
 
     return UCS_OK;
@@ -124,13 +131,43 @@ UCS_CLASS_DEFINE_NEW_FUNC(uct_furiosa_ep_t, uct_ep_t,
                           const uct_ep_params_t *);
 UCS_CLASS_DEFINE_DELETE_FUNC(uct_furiosa_ep_t, uct_ep_t);
 
-static int
-uct_furiosa_iface_is_reachable(const uct_iface_h tl_iface,
-                               const uct_device_addr_t *dev_addr,
-                               const uct_iface_addr_t *iface_addr)
+static ucs_status_t
+uct_furiosa_iface_get_address(uct_iface_h tl_iface,
+                              uct_iface_addr_t *iface_addr)
 {
-    /* PoC: same-host / loopback always reachable */
-    return 1;
+    uct_furiosa_iface_t *iface = ucs_derived_of(tl_iface,
+                                                 uct_furiosa_iface_t);
+
+    *(uct_furiosa_iface_addr_t *)iface_addr = iface->id;
+    return UCS_OK;
+}
+static int
+uct_furiosa_iface_is_reachable_v2(
+        const uct_iface_h tl_iface,
+        const uct_iface_is_reachable_params_t *params)
+{
+    uct_furiosa_iface_t *iface = ucs_derived_of(tl_iface,
+                                                 uct_furiosa_iface_t);
+    uct_furiosa_iface_addr_t *addr;
+
+    if (!uct_iface_is_reachable_params_addrs_valid(params)) {
+        return 0;
+    }
+
+    addr = (uct_furiosa_iface_addr_t *)params->iface_addr;
+    if (addr == NULL) {
+        uct_iface_fill_info_str_buf(params, "no iface address");
+        return 0;
+    }
+
+    if (iface->id != *addr) {
+        uct_iface_fill_info_str_buf(
+                params, "different iface id %" PRIx64 " vs %" PRIx64,
+                iface->id, *addr);
+        return 0;
+    }
+
+    return uct_iface_scope_is_reachable(tl_iface, params);
 }
 
 
@@ -186,9 +223,8 @@ static uct_iface_ops_t uct_furiosa_iface_ops = {
     .iface_query              = uct_furiosa_iface_query,
     .iface_get_device_address = (uct_iface_get_device_address_func_t)
             ucs_empty_function_return_success,
-    .iface_get_address        = (uct_iface_get_address_func_t)
-            ucs_empty_function_return_success,
-    .iface_is_reachable       = uct_furiosa_iface_is_reachable
+    .iface_get_address        = uct_furiosa_iface_get_address,
+    .iface_is_reachable       = uct_base_iface_is_reachable
 };
 
 static uct_iface_internal_ops_t uct_furiosa_iface_internal_ops = {
@@ -201,8 +237,7 @@ static uct_iface_internal_ops_t uct_furiosa_iface_internal_ops = {
             ucs_empty_function_return_unsupported,
     .ep_connect_to_ep_v2   = (uct_ep_connect_to_ep_v2_func_t)
             ucs_empty_function_return_unsupported,
-    .iface_is_reachable_v2 = (uct_iface_is_reachable_v2_func_t)
-            ucs_empty_function_return_zero,
+    .iface_is_reachable_v2 = uct_furiosa_iface_is_reachable_v2,
     .ep_is_connected       = (uct_ep_is_connected_func_t)
             ucs_empty_function_return_zero_int
 };
@@ -218,6 +253,7 @@ static UCS_CLASS_INIT_FUNC(uct_furiosa_iface_t, uct_md_h md,
                               tl_config UCS_STATS_ARG(params->stats_root)
                                       UCS_STATS_ARG(UCT_FURIOSA_TL_NAME));
 
+    self->id = (uct_furiosa_iface_addr_t)((uct_furiosa_md_t *)md)->device_id;
     return UCS_OK;
 }
 

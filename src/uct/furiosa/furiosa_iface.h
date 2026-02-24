@@ -9,11 +9,11 @@
 #include <uct/base/uct_iface.h>
 
 #define UCT_FURIOSA_TL_NAME "furiosa"
-
+typedef uint64_t uct_furiosa_iface_addr_t;
 typedef struct uct_furiosa_iface {
-    uct_base_iface_t super;
+    uct_base_iface_t             super;
+    uct_furiosa_iface_addr_t     id;
 } uct_furiosa_iface_t;
-
 
 typedef struct uct_furiosa_ep {
     uct_base_ep_t super;
