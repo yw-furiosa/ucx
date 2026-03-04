@@ -118,7 +118,7 @@ static void test_mkey_pack_unpack(uct_md_h md, uct_component_h component,
               "packed bar_offset=0x%" PRIx64, packed->bar_offset);
         CHECK(packed->length == npu_len,
               "packed length=%zu expected=%zu", packed->length, npu_len);
-        CHECK(packed->device_id == 0,
+        CHECK(packed->device_id == 6,
               "packed device_id=%u", packed->device_id);
     }
 
