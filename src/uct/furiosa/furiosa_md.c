@@ -1,0 +1,493 @@
+/**
+ * Copyright (C) FuriosaAI, 2025-2026. ALL RIGHTS RESERVED.
+ * See file LICENSE for terms.
+ */
+
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
+#include "furiosa_md.h"
+
+#include <ucs/memory/memtype_cache.h>
+#include <uct/furiosa/base/furiosa_base.h>
+#include <ucs/sys/module.h>
+
+#include <inttypes.h>
+#include <fcntl.h>
+#include <pthread.h>
+
+
+static ucs_config_field_t uct_furiosa_md_config_table[] = {
+    {"", "", NULL, ucs_offsetof(uct_furiosa_md_config_t, super),
+     UCS_CONFIG_TYPE_TABLE(uct_md_config_table)},
+
+    {"DEVICE_ID", "0", "Index of the Furiosa NPU device.",
+     ucs_offsetof(uct_furiosa_md_config_t, device_id), UCS_CONFIG_TYPE_INT},
+
+    {NULL}
+};
+
+static ucs_status_t uct_furiosa_md_query(uct_md_h md, uct_md_attr_v2_t *attr)
+{
+    uct_md_base_md_query(attr);
+    attr->flags            = UCT_MD_FLAG_REG | UCT_MD_FLAG_NEED_RKEY | UCT_MD_FLAG_ALLOC;
+    attr->reg_mem_types    = UCS_BIT(UCS_MEMORY_TYPE_RDMA) |
+                             UCS_BIT(UCS_MEMORY_TYPE_HOST);
+    attr->alloc_mem_types  = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
+    attr->detect_mem_types = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
+    attr->dmabuf_mem_types = UCS_BIT(UCS_MEMORY_TYPE_RDMA);
+    attr->rkey_packed_size = sizeof(uct_furiosa_rkey_t);
+    return UCS_OK;
+}
+
+static void uct_furiosa_md_close(uct_md_h uct_md)
+{
+    uct_furiosa_md_t *md = ucs_derived_of(uct_md, uct_furiosa_md_t);
+
+    if (md->dmabuf_addr != NULL) {
+        uct_furiosa_base_munmap(md->dmabuf_addr, md->dmabuf_size);
+    }
+    uct_furiosa_base_close_dmabuf_fd(md->dmabuf_fd);
+    if (md->bar4_fd_owned) {
+        uct_furiosa_base_close_fd(md->bar4_fd);
+    }
+    ucs_free(md);
+}
+
+static ucs_status_t
+uct_furiosa_md_query_attributes(uct_md_h md, const void *addr, size_t length,
+                                ucs_memory_info_t *mem_info, int *dmabuf_fd)
+{
+    uct_furiosa_md_t *fmd = ucs_derived_of(md, uct_furiosa_md_t);
+    void *begin;
+    void *end;
+
+    /*
+     * FIXME: This mmap-based address range check is a PoC workaround.
+     * We mmap BAR4 in md_open solely to obtain a host VA range, then detect
+     * NPU memory by checking if a pointer falls within that range.
+     * In production, we should use device-runtime's allocator interface to
+     * determine whether a given address belongs to the NPU.
+     */
+    if (fmd->dmabuf_addr == NULL) {
+        return UCS_ERR_UNSUPPORTED;
+    }
+
+    begin = fmd->dmabuf_addr;
+    end   = (uint8_t *)begin + fmd->dmabuf_size;
+
+    if ((addr < begin) || (addr >= end)) {
+        mem_info->type = UCS_MEMORY_TYPE_LAST;
+        return UCS_ERR_OUT_OF_RANGE;
+    }
+
+    *dmabuf_fd             = fmd->dmabuf_fd;
+    mem_info->type         = UCS_MEMORY_TYPE_RDMA;
+    mem_info->base_address = fmd->dmabuf_addr;
+    mem_info->alloc_length = (size_t)fmd->dmabuf_size;
+    mem_info->sys_dev      = UCS_SYS_DEVICE_ID_UNKNOWN;
+    return UCS_OK;
+}
+
+static ucs_status_t uct_furiosa_md_mem_query(uct_md_h md, const void *addr,
+                                              const size_t length,
+                                              uct_md_mem_attr_t *mem_attr_p)
+{
+    int dmabuf_fd = UCT_DMABUF_FD_INVALID;
+    ucs_status_t status;
+    ucs_memory_info_t mem_info;
+    int dup_fd;
+
+    status = uct_furiosa_md_query_attributes(md, addr, length, &mem_info,
+                                             &dmabuf_fd);
+    if (status != UCS_OK) {
+        return status;
+    }
+
+    ucs_memtype_cache_update(mem_info.base_address, mem_info.alloc_length,
+                             mem_info.type, mem_info.sys_dev);
+
+    if (mem_attr_p->field_mask & UCT_MD_MEM_ATTR_FIELD_MEM_TYPE) {
+        mem_attr_p->mem_type = mem_info.type;
+    }
+
+    if (mem_attr_p->field_mask & UCT_MD_MEM_ATTR_FIELD_SYS_DEV) {
+        mem_attr_p->sys_dev = mem_info.sys_dev;
+    }
+
+    if (mem_attr_p->field_mask & UCT_MD_MEM_ATTR_FIELD_BASE_ADDRESS) {
+        mem_attr_p->base_address = mem_info.base_address;
+    }
+
+    if (mem_attr_p->field_mask & UCT_MD_MEM_ATTR_FIELD_ALLOC_LENGTH) {
+        mem_attr_p->alloc_length = mem_info.alloc_length;
+    }
+
+    if (mem_attr_p->field_mask & UCT_MD_MEM_ATTR_FIELD_DMABUF_FD) {
+        dup_fd = dup(dmabuf_fd);
+        if (dup_fd < 0) {
+            return UCS_ERR_IO_ERROR;
+        }
+        mem_attr_p->dmabuf_fd = dup_fd;
+    }
+
+    if (mem_attr_p->field_mask & UCT_MD_MEM_ATTR_FIELD_DMABUF_OFFSET) {
+        mem_attr_p->dmabuf_offset = UCS_PTR_BYTE_DIFF(mem_info.base_address,
+                                                       addr);
+    }
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_md_detect_memory_type(uct_md_h md, const void *addr, size_t length,
+                                  ucs_memory_type_t *mem_type_p)
+{
+    uct_md_mem_attr_t mem_attr;
+    ucs_status_t status;
+
+    mem_attr.field_mask = UCT_MD_MEM_ATTR_FIELD_MEM_TYPE;
+    status              = uct_furiosa_md_mem_query(md, addr, length, &mem_attr);
+    if (status != UCS_OK) {
+        return status;
+    }
+
+    *mem_type_p = mem_attr.mem_type;
+    return UCS_OK;
+}
+
+
+/* TODO: Replace with device-runtime allocator interface.
+ * This stub always returns the BAR4 mmap base (offset 0). Every caller
+ * gets the same address, so only one allocation can be live at a time.
+ * Sufficient for single-buffer PoC / perftest. */
+static ucs_status_t
+uct_furiosa_md_mem_alloc(uct_md_h uct_md, size_t *length_p, void **address_p,
+                         ucs_memory_type_t mem_type, ucs_sys_device_t sys_dev,
+                         unsigned flags, const char *alloc_name,
+                         uct_mem_h *memh_p)
+{
+    uct_furiosa_md_t *md = ucs_derived_of(uct_md, uct_furiosa_md_t);
+    uct_furiosa_mem_t *memh;
+
+    if (mem_type != UCS_MEMORY_TYPE_RDMA) {
+        return UCS_ERR_UNSUPPORTED;
+    }
+
+    if (md->dmabuf_addr == NULL) {
+        ucs_error("furiosa: cannot allocate, BAR4 not mapped");
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    if (*length_p > md->dmabuf_size) {
+        ucs_error("furiosa: alloc request %zu exceeds BAR4 size %" PRIu64,
+                  *length_p, md->dmabuf_size);
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    memh = ucs_malloc(sizeof(*memh), "uct_furiosa_mem_t");
+    if (memh == NULL) {
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    memh->bar_offset = NPU_BAR4_RESERVED_SIZE;
+    memh->address    = md->dmabuf_addr;
+    memh->length     = *length_p;
+    memh->device_id  = md->device_id;
+
+    *address_p = md->dmabuf_addr;
+    *memh_p    = memh;
+
+    ucs_debug("furiosa: mem_alloc len=%zu addr=%p (stub, always offset 0)",
+              *length_p, md->dmabuf_addr);
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_md_mem_free(uct_md_h uct_md, uct_mem_h memh)
+{
+    ucs_free(memh);
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_md_mem_reg(uct_md_h uct_md, void *address, size_t length,
+                       const uct_md_mem_reg_params_t *params,
+                       uct_mem_h *memh_p)
+{
+    uct_furiosa_md_t *md = ucs_derived_of(uct_md, uct_furiosa_md_t);
+    uct_furiosa_mem_t *memh;
+    void *begin;
+    void *end;
+    uint64_t offset;
+
+    if (md->dmabuf_addr == NULL) {
+        ucs_error("furiosa: cannot register memory, BAR4 not mapped");
+        return UCS_ERR_UNSUPPORTED;
+    }
+
+    begin = md->dmabuf_addr;
+    end   = (uint8_t *)begin + md->dmabuf_size;
+
+    if ((address >= begin) && ((uint8_t *)address + length <= (uint8_t *)end)) {
+        /* Fully inside BAR4: fall through to NPU registration below */
+    } else if ((uint8_t *)address + length <= (uint8_t *)begin ||
+               address >= end) {
+        /* Fully outside BAR4: host memory passthrough registration.
+         * Our put/get operations use remote_addr directly (not rkey),
+         * so the bar_offset is irrelevant for host-to-host copies. */
+        memh = ucs_malloc(sizeof(*memh), "uct_furiosa_mem_t");
+        if (memh == NULL) {
+            return UCS_ERR_NO_MEMORY;
+        }
+
+        memh->bar_offset = 0;
+        memh->address    = address;
+        memh->length     = length;
+        memh->device_id  = md->device_id;
+
+        ucs_debug("furiosa: host mem_reg addr=%p len=%zu (passthrough)",
+                  address, length);
+
+        *memh_p = memh;
+        return UCS_OK;
+    } else {
+        /* Partially overlapping BAR4 region: reject */
+        ucs_error("furiosa: address %p length %zu partially overlaps "
+                  "BAR4 range [%p, %p)",
+                  address, length, begin, end);
+        return UCS_ERR_INVALID_PARAM;
+    }
+
+    memh = ucs_malloc(sizeof(*memh), "uct_furiosa_mem_t");
+    if (memh == NULL) {
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    /* Compute offset relative to BAR4 physical base (including reserved) */
+    offset = (uint64_t)UCS_PTR_BYTE_DIFF(begin, address) +
+             NPU_BAR4_RESERVED_SIZE;
+
+    memh->bar_offset = offset;
+    memh->address    = address;
+    memh->length     = length;
+    memh->device_id  = md->device_id;
+
+    ucs_debug("furiosa: mem_reg addr=%p len=%zu bar_offset=0x%" PRIx64
+              " dev=%u",
+              address, length, memh->bar_offset, memh->device_id);
+
+    *memh_p = memh;
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_md_mem_dereg(uct_md_h uct_md,
+                         const uct_md_mem_dereg_params_t *params)
+{
+    uct_furiosa_mem_t *memh;
+
+    UCT_MD_MEM_DEREG_CHECK_PARAMS(params, 0);
+
+    memh = params->memh;
+    ucs_debug("furiosa: mem_dereg addr=%p len=%zu", memh->address,
+              memh->length);
+    ucs_free(memh);
+    return UCS_OK;
+}
+
+
+static ucs_status_t
+uct_furiosa_md_mkey_pack(uct_md_h uct_md, uct_mem_h memh, void *address,
+                         size_t length,
+                         const uct_md_mkey_pack_params_t *params,
+                         void *mkey_buffer)
+{
+    uct_furiosa_md_t *md        = ucs_derived_of(uct_md, uct_furiosa_md_t);
+    uct_furiosa_mem_t *mem_hndl = memh;
+    uct_furiosa_rkey_t *packed  = mkey_buffer;
+
+    packed->bar_phys_addr = md->bar_phys_addr;
+    packed->bar_offset    = mem_hndl->bar_offset;
+    packed->length        = mem_hndl->length;
+    packed->device_id     = mem_hndl->device_id;
+
+    ucs_debug("furiosa: mkey_pack bar_phys=0x%" PRIx64
+              " offset=0x%" PRIx64 " len=%zu dev=%u",
+              packed->bar_phys_addr, packed->bar_offset,
+              packed->length, packed->device_id);
+
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_rkey_unpack(uct_component_t *component, const void *rkey_buffer,
+                        const uct_rkey_unpack_params_t *params,
+                        uct_rkey_t *rkey_p, void **handle_p)
+{
+    const uct_furiosa_rkey_t *packed = rkey_buffer;
+    uct_furiosa_rkey_t *key;
+
+    key = ucs_malloc(sizeof(*key), "uct_furiosa_rkey_t");
+    if (key == NULL) {
+        ucs_error("failed to allocate memory for uct_furiosa_rkey_t");
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    key->bar_phys_addr = packed->bar_phys_addr;
+    key->bar_offset    = packed->bar_offset;
+    key->length        = packed->length;
+    key->device_id     = packed->device_id;
+
+    *handle_p = NULL;
+    *rkey_p   = (uintptr_t)key;
+
+    ucs_debug("furiosa: rkey_unpack bar_phys=0x%" PRIx64
+              " offset=0x%" PRIx64 " len=%zu dev=%u",
+              key->bar_phys_addr, key->bar_offset,
+              key->length, key->device_id);
+
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_furiosa_rkey_release(uct_component_t *component, uct_rkey_t rkey,
+                         void *handle)
+{
+    ucs_assert(handle == NULL);
+    ucs_free((void *)rkey);
+    return UCS_OK;
+}
+
+static uct_md_ops_t uct_furiosa_md_ops = {
+    .close              = uct_furiosa_md_close,
+    .query              = uct_furiosa_md_query,
+    .mem_alloc          = uct_furiosa_md_mem_alloc,
+    .mem_free           = uct_furiosa_md_mem_free,
+    .mem_advise         = (uct_md_mem_advise_func_t)ucs_empty_function_return_unsupported,
+    .mem_reg            = uct_furiosa_md_mem_reg,
+    .mem_dereg          = uct_furiosa_md_mem_dereg,
+    .mem_query          = uct_furiosa_md_mem_query,
+    .mkey_pack          = uct_furiosa_md_mkey_pack,
+    .mem_attach         = (uct_md_mem_attach_func_t)ucs_empty_function_return_unsupported,
+    .detect_memory_type = uct_furiosa_md_detect_memory_type,
+};
+
+static ucs_status_t
+uct_furiosa_md_open(uct_component_h component, const char *md_name,
+                    const uct_md_config_t *md_config, uct_md_h *md_p)
+{
+    uct_furiosa_md_config_t *config = ucs_derived_of(md_config,
+                                                     uct_furiosa_md_config_t);
+    uct_furiosa_md_t *md;
+    ucs_status_t status;
+    struct npu_bar_info bar_info;
+    int bar4_fd;
+    int dmabuf_fd;
+    void *dmabuf_addr;
+    md = ucs_malloc(sizeof(uct_furiosa_md_t), "uct_furiosa_md_t");
+    if (md == NULL) {
+        ucs_error("failed to allocate memory for uct_furiosa_md_t");
+        return UCS_ERR_NO_MEMORY;
+    }
+    bar4_fd = uct_furiosa_base_open_bar4(config->device_id);
+    if (bar4_fd < 0) {
+        ucs_error("failed to open furiosa npu%d BAR4", config->device_id);
+        status = UCS_ERR_NO_DEVICE;
+        goto err_free_md;
+    }
+    status = uct_furiosa_base_get_bar_info(bar4_fd, &bar_info);
+    if (status != UCS_OK) {
+        goto err_close_bar4;
+    }
+
+    /* Export dmabuf for future RDMA registration (ibv_reg_dmabuf_mr).
+     * This is non-fatal: we keep the fd but don't mmap through it. */
+    dmabuf_fd = -1;
+    status = uct_furiosa_base_export_dmabuf(bar4_fd, NPU_BAR4_RESERVED_SIZE,
+                                             UCT_FURIOSA_POC_MAP_SIZE,
+                                             &dmabuf_fd);
+    if (status != UCS_OK) {
+        ucs_warn("furiosa: dmabuf export failed (non-fatal)");
+        dmabuf_fd = -1;
+    }
+
+    /* FIXME: This direct BAR4 mmap is a PoC workaround to get a host VA
+     * range for memory type detection. In production, the Furiosa
+     * device-runtime allocator would provide mapped regions, and the MD
+     * would query that allocator instead of mapping BAR4 itself. */
+    dmabuf_addr = NULL;
+    status = uct_furiosa_base_mmap_bar4(bar4_fd, NPU_BAR4_RESERVED_SIZE,
+                                         UCT_FURIOSA_POC_MAP_SIZE,
+                                         &dmabuf_addr);
+    if (status != UCS_OK) {
+        goto err_close_dmabuf;
+    }
+
+    md->bar4_fd        = bar4_fd;
+    md->bar4_fd_owned  = true;
+    md->device_id      = config->device_id;
+    md->bar_phys_addr  = bar_info.bar_phy_addr;
+    md->bar_size       = bar_info.bar_size;
+    md->dmabuf_fd      = dmabuf_fd;
+    md->dmabuf_addr    = dmabuf_addr;
+    md->dmabuf_size    = UCT_FURIOSA_POC_MAP_SIZE;
+    md->super.ops      = &uct_furiosa_md_ops;
+    md->super.component = &uct_furiosa_component;
+
+    *md_p = (uct_md_h)md;
+    ucs_debug("opened furiosa MD: npu%u bar_phys=0x%" PRIx64
+              " dmabuf_addr=%p dmabuf_size=0x%" PRIx64,
+              md->device_id, md->bar_phys_addr,
+              md->dmabuf_addr, md->dmabuf_size);
+    return UCS_OK;
+
+err_close_dmabuf:
+    uct_furiosa_base_close_dmabuf_fd(dmabuf_fd);
+err_close_bar4:
+    uct_furiosa_base_close_fd(bar4_fd);
+err_free_md:
+    ucs_free(md);
+    return status;
+}
+
+static ucs_status_t
+uct_furiosa_query_md_resources(uct_component_h component,
+                               uct_md_resource_desc_t **resources_p,
+                               unsigned *num_resources_p)
+{
+    ucs_status_t status;
+
+    status = uct_furiosa_base_discover_devices();
+    if (status != UCS_OK) {
+        ucs_debug("furiosa device discovery failed, no devices available");
+        return uct_md_query_empty_md_resource(resources_p, num_resources_p);
+    }
+
+    return uct_md_query_single_md_resource(component, resources_p,
+                                           num_resources_p);
+}
+
+uct_component_t uct_furiosa_component = {
+    .query_md_resources = uct_furiosa_query_md_resources,
+    .md_open            = uct_furiosa_md_open,
+    .cm_open            = (uct_component_cm_open_func_t)
+                          ucs_empty_function_return_unsupported,
+    .rkey_unpack        = uct_furiosa_rkey_unpack,
+    .rkey_ptr           = (uct_component_rkey_ptr_func_t)
+                          ucs_empty_function_return_unsupported,
+    .rkey_release       = uct_furiosa_rkey_release,
+    .rkey_compare       = uct_base_rkey_compare,
+    .name               = "furiosa",
+    .md_config          = {
+        .name           = "Furiosa NPU memory domain",
+        .prefix         = "FURIOSA_",
+        .table          = uct_furiosa_md_config_table,
+        .size           = sizeof(uct_furiosa_md_config_t),
+    },
+    .cm_config          = UCS_CONFIG_EMPTY_GLOBAL_LIST_ENTRY,
+    .tl_list            = UCT_COMPONENT_TL_LIST_INITIALIZER(&uct_furiosa_component),
+    .flags              = 0,
+    .md_vfs_init        = (uct_component_md_vfs_init_func_t)ucs_empty_function
+};
+UCT_COMPONENT_REGISTER(&uct_furiosa_component);
