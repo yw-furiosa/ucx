@@ -32,11 +32,14 @@ AS_IF([test "x$furiosa_checked" != "xyes"],
          CPPFLAGS="$CPPFLAGS $FURIOSA_CPPFLAGS"
          LDFLAGS="$LDFLAGS $FURIOSA_LDFLAGS"
 
-         dnl Furiosa NPU uses renegade_driver directly via ioctl.
-         dnl Check for /dev/rngd directory existence or header availability.
-         dnl For PoC, we only need standard system headers (ioctl, mmap).
-         AC_CHECK_HEADERS([sys/ioctl.h],
+         AC_CHECK_HEADERS([furiosa_mem.h],
                           [furiosa_happy="yes"], [furiosa_happy="no"])
+
+         AS_IF([test "x$furiosa_happy" = "xyes"],
+               [AC_CHECK_LIB([furiosa_mem], [furiosa_mem_init],
+                             [], [furiosa_happy="no"])])
+
+         FURIOSA_LIBS="-lfuriosa_mem"
 
          CPPFLAGS="$save_CPPFLAGS"
          LDFLAGS="$save_LDFLAGS"

@@ -12,10 +12,10 @@
 #include <ucs/memory/memtype_cache.h>
 #include <uct/furiosa/base/furiosa_base.h>
 #include <ucs/sys/module.h>
+#include <furiosa_mem.h>
 
 #include <inttypes.h>
 #include <fcntl.h>
-#include <pthread.h>
 
 
 static ucs_config_field_t uct_furiosa_md_config_table[] = {
@@ -40,13 +40,7 @@ static void uct_furiosa_md_close(uct_md_h uct_md)
 {
     uct_furiosa_md_t *md = ucs_derived_of(uct_md, uct_furiosa_md_t);
 
-    if (md->dmabuf_addr != NULL) {
-        uct_furiosa_base_munmap(md->dmabuf_addr, md->dmabuf_size);
-    }
-    uct_furiosa_base_close_dmabuf_fd(md->dmabuf_fd);
-    if (md->bar4_fd_owned) {
-        uct_furiosa_base_close_fd(md->bar4_fd);
-    }
+    furiosa_mem_fini(md->device_id);
     ucs_free(md);
 }
 
@@ -55,32 +49,24 @@ uct_furiosa_md_query_attributes(uct_md_h md, const void *addr, size_t length,
                                 ucs_memory_info_t *mem_info, int *dmabuf_fd)
 {
     uct_furiosa_md_t *fmd = ucs_derived_of(md, uct_furiosa_md_t);
-    void *begin;
-    void *end;
+    int dev_id;
+    unsigned resolved_id;
+    void *base;
+    size_t size;
 
-    /*
-     * FIXME: This mmap-based address range check is a PoC workaround.
-     * We mmap BAR4 in md_open solely to obtain a host VA range, then detect
-     * NPU memory by checking if a pointer falls within that range.
-     * In production, we should use device-runtime's allocator interface to
-     * determine whether a given address belongs to the NPU.
-     */
-    if (fmd->dmabuf_addr == NULL) {
-        return UCS_ERR_UNSUPPORTED;
-    }
-
-    begin = fmd->dmabuf_addr;
-    end   = (uint8_t *)begin + fmd->dmabuf_size;
-
-    if ((addr < begin) || (addr >= end)) {
-        mem_info->type = UCS_MEMORY_TYPE_LAST;
+    if (!furiosa_mem_contains(addr)) {
         return UCS_ERR_OUT_OF_RANGE;
     }
 
-    *dmabuf_fd             = fmd->dmabuf_fd;
+    dev_id      = furiosa_mem_get_device_id(addr);
+    resolved_id = dev_id >= 0 ? (unsigned)dev_id : fmd->device_id;
+    base        = furiosa_mem_get_base(resolved_id);
+    size        = furiosa_mem_get_size(resolved_id);
+
+    *dmabuf_fd             = furiosa_mem_get_dmabuf_fd(resolved_id);
     mem_info->type         = UCS_MEMORY_TYPE_RDMA;
-    mem_info->base_address = fmd->dmabuf_addr;
-    mem_info->alloc_length = (size_t)fmd->dmabuf_size;
+    mem_info->base_address = base;
+    mem_info->alloc_length = size;
     mem_info->sys_dev      = UCS_SYS_DEVICE_ID_UNKNOWN;
     return UCS_OK;
 }
@@ -128,8 +114,7 @@ static ucs_status_t uct_furiosa_md_mem_query(uct_md_h md, const void *addr,
     }
 
     if (mem_attr_p->field_mask & UCT_MD_MEM_ATTR_FIELD_DMABUF_OFFSET) {
-        mem_attr_p->dmabuf_offset = UCS_PTR_BYTE_DIFF(mem_info.base_address,
-                                                       addr);
+        mem_attr_p->dmabuf_offset = furiosa_mem_to_offset(addr);
     }
     return UCS_OK;
 }
@@ -172,75 +157,31 @@ uct_furiosa_md_open(uct_component_h component, const char *md_name,
     uct_furiosa_md_config_t *config = ucs_derived_of(md_config,
                                                      uct_furiosa_md_config_t);
     uct_furiosa_md_t *md;
-    ucs_status_t status;
-    struct npu_bar_info bar_info;
-    int bar4_fd;
-    int dmabuf_fd;
-    void *dmabuf_addr;
+    int ret;
+
     md = ucs_malloc(sizeof(uct_furiosa_md_t), "uct_furiosa_md_t");
     if (md == NULL) {
         ucs_error("failed to allocate memory for uct_furiosa_md_t");
         return UCS_ERR_NO_MEMORY;
     }
-    bar4_fd = uct_furiosa_base_open_bar4(config->device_id);
-    if (bar4_fd < 0) {
-        ucs_error("failed to open furiosa npu%d BAR4", config->device_id);
-        status = UCS_ERR_NO_DEVICE;
-        goto err_free_md;
-    }
-    status = uct_furiosa_base_get_bar_info(bar4_fd, &bar_info);
-    if (status != UCS_OK) {
-        goto err_close_bar4;
+
+    ret = furiosa_mem_init(config->device_id);
+    if (ret < 0) {
+        ucs_error("furiosa_mem_init(npu%d) failed: %d", config->device_id, ret);
+        ucs_free(md);
+        return UCS_ERR_NO_DEVICE;
     }
 
-    /* Export dmabuf for future RDMA registration (ibv_reg_dmabuf_mr).
-     * This is non-fatal: we keep the fd but don't mmap through it. */
-    dmabuf_fd = -1;
-    status = uct_furiosa_base_export_dmabuf(bar4_fd, NPU_BAR4_RESERVED_SIZE,
-                                             UCT_FURIOSA_POC_MAP_SIZE,
-                                             &dmabuf_fd);
-    if (status != UCS_OK) {
-        ucs_warn("furiosa: dmabuf export failed (non-fatal)");
-        dmabuf_fd = -1;
-    }
-
-    /* FIXME: This direct BAR4 mmap is a PoC workaround to get a host VA
-     * range for memory type detection. In production, the Furiosa
-     * device-runtime allocator would provide mapped regions, and the MD
-     * would query that allocator instead of mapping BAR4 itself. */
-    dmabuf_addr = NULL;
-    status = uct_furiosa_base_mmap_bar4(bar4_fd, NPU_BAR4_RESERVED_SIZE,
-                                         UCT_FURIOSA_POC_MAP_SIZE,
-                                         &dmabuf_addr);
-    if (status != UCS_OK) {
-        goto err_close_dmabuf;
-    }
-
-    md->bar4_fd        = bar4_fd;
-    md->bar4_fd_owned  = true;
-    md->device_id      = config->device_id;
-    md->bar_phys_addr  = bar_info.bar_phy_addr;
-    md->bar_size       = bar_info.bar_size;
-    md->dmabuf_fd      = dmabuf_fd;
-    md->dmabuf_addr    = dmabuf_addr;
-    md->dmabuf_size    = UCT_FURIOSA_POC_MAP_SIZE;
-    md->super.ops      = &uct_furiosa_md_ops;
+    md->device_id       = config->device_id;
+    md->super.ops       = &uct_furiosa_md_ops;
     md->super.component = &uct_furiosa_component;
 
     *md_p = (uct_md_h)md;
-    ucs_debug("opened furiosa MD: npu%u bar_phys=0x%" PRIx64
-              " dmabuf_addr=%p dmabuf_size=0x%" PRIx64,
-              md->device_id, md->bar_phys_addr,
-              md->dmabuf_addr, md->dmabuf_size);
+    ucs_debug("opened furiosa MD: npu%u base=%p size=%zu (via libfuriosa_mem)",
+              md->device_id,
+              furiosa_mem_get_base(md->device_id),
+              furiosa_mem_get_size(md->device_id));
     return UCS_OK;
-
-err_close_dmabuf:
-    uct_furiosa_base_close_dmabuf_fd(dmabuf_fd);
-err_close_bar4:
-    uct_furiosa_base_close_fd(bar4_fd);
-err_free_md:
-    ucs_free(md);
-    return status;
 }
 
 static ucs_status_t
