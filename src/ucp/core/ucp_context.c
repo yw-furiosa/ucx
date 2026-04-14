@@ -1750,9 +1750,10 @@ ucp_add_component_resources(ucp_context_h context, ucp_rsc_index_t cmpt_index,
             goto out;
         }
 
-        if (num_tl_resources == 0) {
-            /* If the MD does not have transport resources (device or sockaddr),
-             * don't use it */
+        if ((num_tl_resources == 0) &&
+            !(md_attr->detect_mem_types | md_attr->dmabuf_mem_types)) {
+            /* If the MD does not have transport resources (device or sockaddr)
+             * and is not a memory-type detect / dmabuf provider, don't use it */
             ucs_debug("closing md %s because it has no selected transport resources",
                       context->tl_mds[md_index].rsc.md_name);
             uct_md_close(context->tl_mds[md_index].md);
