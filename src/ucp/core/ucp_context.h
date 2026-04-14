@@ -684,9 +684,9 @@ ucp_memory_detect_internal(ucp_context_h context, const void *address,
     status = ucs_memtype_cache_lookup(address, length, mem_info);
     if (ucs_likely(status == UCS_ERR_NO_ELEM)) {
         ucs_trace_req("address %p length %zu: not found in memtype cache, "
-                      "assuming host memory",
+                      "querying detect MDs",
                       address, length);
-        goto out_host_mem;
+        ucp_memory_detect_slowpath(context, address, length, mem_info);
     } else if (ucs_likely(status == UCS_OK)) {
         if (ucs_unlikely(mem_info->type == UCS_MEMORY_TYPE_UNKNOWN)) {
             ucs_trace_req(
